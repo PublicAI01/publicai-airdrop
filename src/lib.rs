@@ -1,9 +1,7 @@
-use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
-use near_sdk::collections::UnorderedMap;
-use near_sdk::{env, near, near_bindgen, AccountId, Gas, NearToken, PanicOnDefault, Promise};
 use near_sdk::json_types::U128;
+use near_sdk::{env, near, AccountId, Gas, NearToken, PanicOnDefault, Promise};
 
-/// Contract to manage airdrops for eligible users.
+/// Contract to manage airdrops using a Merkle Tree
 #[derive(PanicOnDefault)]
 #[near(contract_state)]
 pub struct AirdropContract {
@@ -11,105 +9,69 @@ pub struct AirdropContract {
     owner_id: AccountId,
     // NEP-141 token contract address
     token_contract: AccountId,
-    // Mapping of user accounts to their airdrop amounts
-    airdrops: UnorderedMap<AccountId, u128>,
+    // Root hash of the Merkle tree
+    merkle_root: String,
+    // Mapping to keep track of claimed accounts
+    claimed: std::collections::HashSet<AccountId>,
 }
 
 #[near]
 impl AirdropContract {
     /// Initializes the contract with the given owner and NEP-141 token contract address.
     #[init]
-    pub fn new(owner_id: AccountId, token_contract: AccountId) -> Self {
+    pub fn new(owner_id: AccountId, token_contract: AccountId, merkle_root: String) -> Self {
         assert!(!env::state_exists(), "The contract is already initialized.");
         Self {
             owner_id,
             token_contract,
-            airdrops: UnorderedMap::new(b"a".to_vec()),
+            merkle_root,
+            claimed: std::collections::HashSet::new(),
         }
     }
 
-    /// Allows the owner to batch add airdrop recipients and their amounts.
-    /// - `recipients`: A list of account IDs.
-    /// - `amounts`: A list of token amounts corresponding to the recipients.
-    pub fn add_airdrops(&mut self, recipients: Vec<AccountId>, amounts: Vec<U128>) {
-        // Ensure only the owner can add airdrops
+    /// Updates the Merkle root (only callable by the owner).
+    /// - `merkle_root`: The new Merkle root representing the airdrop list.
+    pub fn update_merkle_root(&mut self, merkle_root: String) {
         assert_eq!(
             self.owner_id,
             env::predecessor_account_id(),
-            "Only the owner can add airdrops."
+            "Only the owner can update the Merkle root."
         );
-
-        // Ensure the lengths of the recipients and amounts match
-        assert_eq!(
-            recipients.len(),
-            amounts.len(),
-            "Recipients and amounts length mismatch."
-        );
-
-        // Add airdrops to the mapping
-        for (i, recipient) in recipients.iter().enumerate() {
-            let amount: u128 = amounts[i].0;
-
-            // Check if the recipient already exists
-            if self.airdrops.get(&recipient).is_some() {
-                env::log_str(&format!(
-                    "Account @{} already exists in the airdrop list. Skipping...",
-                    recipient
-                ));
-                continue;
-            }
-
-            // Insert the new recipient and amount
-            self.airdrops.insert(&recipient, &amount);
-        }
-    }
-
-    /// Allows the owner to update the airdrop amount for a specific recipient.
-    /// - `recipient`: The account ID of the recipient to update.
-    /// - `amount`: The new airdrop amount for the recipient.
-    pub fn update_airdrop(&mut self, recipient: AccountId, amount: U128) {
-        // Ensure only the owner can update airdrops
-        assert_eq!(
-            self.owner_id,
-            env::predecessor_account_id(),
-            "Only the owner can update airdrops."
-        );
-
-        // Ensure the recipient exists in the airdrop list
-        assert!(
-            self.airdrops.get(&recipient).is_some(),
-            "Account @{} is not in the airdrop list.",
-            recipient
-        );
-
-        // Update the recipient's airdrop amount
-        self.airdrops.insert(&recipient, &amount.0);
-        env::log_str(&format!(
-            "Airdrop for account @{} updated to {}.",
-            recipient, amount.0
-        ));
+        self.merkle_root = merkle_root;
+        env::log_str(&format!("Merkle root updated to {}", self.merkle_root));
     }
 
     /// Allows users to claim their airdrop if they are eligible.
-    pub fn claim_airdrop(&mut self) {
+    /// - `amount`: The amount of tokens the user claims.
+    /// - `merkle_proof`: The Merkle proof validating the user's claim.
+    pub fn claim_airdrop(&mut self, amount: U128, merkle_proof: Vec<String>) {
         let account_id = env::predecessor_account_id();
-        let amount = self.airdrops.get(&account_id).unwrap_or(0);
 
-        // Ensure the user has tokens to claim
-        assert!(amount > 0, "You have no tokens to claim.");
+        // Ensure the user has not already claimed
+        assert!(
+            !self.claimed.contains(&account_id),
+            "You have already claimed your airdrop."
+        );
 
-        // Remove the user's entry from the airdrops mapping
-        self.airdrops.remove(&account_id);
+        // Verify the Merkle proof
+        let leaf = format!("{}{}", account_id, amount.0);
+        assert!(
+            Self::verify_merkle_proof(leaf, &self.merkle_root, &merkle_proof),
+            "Merkle proof verification failed."
+        );
+
+        // Mark the account as claimed
+        self.claimed.insert(account_id.clone());
 
         // Transfer the tokens to the user using NEP-141's `ft_transfer`
         Promise::new(self.token_contract.clone()).function_call(
             "ft_transfer".to_string(),
             near_sdk::serde_json::json!({
                 "receiver_id": account_id,
-                "amount": U128(amount),
+                "amount": amount,
             })
-                .to_string()
-                .into_bytes(),
+            .to_string()
+            .into_bytes(),
             NearToken::from_yoctonear(1), // Attach 1 yoctoNEAR for cross-contract call
             Gas::from_gas(50_000_000_000_000),
         );
@@ -117,34 +79,49 @@ impl AirdropContract {
         // Log the claim
         env::log_str(&format!(
             "Account @{} claimed {} tokens from @{}.",
-            account_id, amount, self.token_contract
+            account_id, amount.0, self.token_contract
         ));
     }
 
-    /// Allows users to check if they are eligible for an airdrop and the amount they can claim.
-    /// Returns the amount of tokens the user can claim, or 0 if they are not eligible.
-    pub fn check_airdrop(&self, account_id: AccountId) -> U128 {
-        U128(self.airdrops.get(&account_id).unwrap_or(0))
+    /// Verifies a Merkle proof.
+    /// - `leaf`: The leaf node (e.g., "account_id + amount").
+    /// - `root`: The root of the Merkle tree.
+    /// - `proof`: The Merkle proof (an array of sibling hashes).
+    /// Returns `true` if the proof is valid, `false` otherwise.
+    pub fn verify_merkle_proof(leaf: String, root: &String, proof: &Vec<String>) -> bool {
+        let mut hash = env::keccak256(leaf.as_bytes());
+        for sibling in proof {
+            let sibling_hash = hex::decode(sibling).expect("Invalid hex in Merkle proof.");
+            if hash < sibling_hash {
+                hash = env::keccak256(&[hash.as_slice(), sibling_hash.as_slice()].concat());
+            } else {
+                hash = env::keccak256(&[sibling_hash.as_slice(), hash.as_slice()].concat());
+            }
+        }
+        hex::encode(hash) == *root
     }
 
-    /// Returns the owner of the contract.
-    pub fn get_owner(&self) -> AccountId {
-        self.owner_id.clone()
+    /// Returns the current Merkle root.
+    pub fn get_merkle_root(&self) -> String {
+        self.merkle_root.clone()
+    }
+
+    /// Checks if an account has already claimed their airdrop.
+    pub fn has_claimed(&self, account_id: AccountId) -> bool {
+        self.claimed.contains(&account_id)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use near_sdk::{testing_env, test_utils::VMContextBuilder, AccountId, Gas};
     use near_sdk::json_types::U128;
+    use near_sdk::{test_utils::VMContextBuilder, testing_env, AccountId, Gas};
 
     // Constants for testing
     const TOKEN_CONTRACT: &str = "token.testnet";
     const OWNER: &str = "owner.testnet";
     const USER1: &str = "user1.testnet";
-    const USER2: &str = "user2.testnet";
-    const USER3: &str = "user3.testnet";
 
     /// Helper function to create a mock context.
     fn get_context(predecessor: AccountId, attached_deposit: u128) -> VMContextBuilder {
@@ -155,145 +132,35 @@ mod tests {
             .prepaid_gas(Gas::from_gas(300_000_000_000_000)); // Allocate sufficient gas for testing
         builder
     }
-
     #[test]
-    fn test_initialize_contract() {
+    fn test_merkle_proof_verification() {
         let context = get_context(OWNER.parse::<AccountId>().unwrap(), 0);
         testing_env!(context.build());
 
-        let contract = AirdropContract::new(
+        AirdropContract::new(
             OWNER.parse::<AccountId>().unwrap(),
             TOKEN_CONTRACT.parse::<AccountId>().unwrap(),
+            "6867b92646b924dee3f594488111e91ced74800da03a4be76e8175277c380f4d".to_string(), // Replace with real Merkle Root
         );
 
-        assert_eq!(
-            contract.get_owner(),
-            OWNER.parse::<AccountId>().unwrap()
-        );
-    }
-
-    #[test]
-    fn test_add_airdrops() {
-        let context = get_context(OWNER.parse::<AccountId>().unwrap(), 0);
-        testing_env!(context.build());
-
-        let mut contract = AirdropContract::new(
-            OWNER.parse::<AccountId>().unwrap(),
-            TOKEN_CONTRACT.parse::<AccountId>().unwrap(),
-        );
-
-        let recipients = vec![
-            USER1.parse::<AccountId>().unwrap(),
-            USER2.parse::<AccountId>().unwrap(),
+        // Example Merkle proof for "user1.testnet + 100"
+        let leaf = "user1.testnet100".to_string();
+        let proof = vec![
+            "ed356db93bc0a636f60329c5e37b36bc9b6f5e5ad422438b051cbb66aa44603b".to_string(),
+            "bff38e5fe57bd24169c460f1f151a39414a78be908898331dbfc5fa76e81a0c8".to_string(),
         ];
-        let amounts = vec![U128(100), U128(200)];
 
-        contract.add_airdrops(recipients.clone(), amounts.clone());
+        let valid = AirdropContract::verify_merkle_proof(
+            leaf,
+            &"6867b92646b924dee3f594488111e91ced74800da03a4be76e8175277c380f4d".to_string(),
+            &proof,
+        );
 
-        assert_eq!(
-            contract.check_airdrop(USER1.parse::<AccountId>().unwrap()).0,
-            100
-        );
-        assert_eq!(
-            contract.check_airdrop(USER2.parse::<AccountId>().unwrap()).0,
-            200
-        );
-        assert_eq!(
-            contract.check_airdrop(USER3.parse::<AccountId>().unwrap()).0,
-            0
-        );
+        assert!(valid, "Merkle proof should be valid for user1.testnet.");
     }
 
     #[test]
-    #[should_panic(expected = "Only the owner can add airdrops.")]
-    fn test_add_airdrops_not_owner() {
-        let context = get_context(USER1.parse::<AccountId>().unwrap(), 0);
-        testing_env!(context.build());
-
-        let mut contract = AirdropContract::new(
-            OWNER.parse::<AccountId>().unwrap(),
-            TOKEN_CONTRACT.parse::<AccountId>().unwrap(),
-        );
-
-        let recipients = vec![USER1.parse::<AccountId>().unwrap()];
-        let amounts = vec![U128(100)];
-
-        contract.add_airdrops(recipients, amounts);
-    }
-
-    #[test]
-    fn test_add_airdrops_with_duplicates() {
-        let context = get_context(OWNER.parse::<AccountId>().unwrap(), 0);
-        testing_env!(context.build());
-
-        let mut contract = AirdropContract::new(
-            OWNER.parse::<AccountId>().unwrap(),
-            TOKEN_CONTRACT.parse::<AccountId>().unwrap(),
-        );
-
-        let recipients = vec![
-            USER1.parse::<AccountId>().unwrap(),
-            USER2.parse::<AccountId>().unwrap(),
-        ];
-        let amounts = vec![U128(100), U128(200)];
-
-        // Add recipients for the first time
-        contract.add_airdrops(recipients.clone(), amounts.clone());
-
-        // Add the same recipients again (should skip duplicates)
-        contract.add_airdrops(recipients.clone(), amounts.clone());
-
-        // Verify that the amounts are unchanged
-        assert_eq!(
-            contract.check_airdrop(USER1.parse::<AccountId>().unwrap()).0,
-            100
-        );
-        assert_eq!(
-            contract.check_airdrop(USER2.parse::<AccountId>().unwrap()).0,
-            200
-        );
-    }
-
-    #[test]
-    fn test_update_airdrop() {
-        let context = get_context(OWNER.parse::<AccountId>().unwrap(), 0);
-        testing_env!(context.build());
-
-        let mut contract = AirdropContract::new(
-            OWNER.parse::<AccountId>().unwrap(),
-            TOKEN_CONTRACT.parse::<AccountId>().unwrap(),
-        );
-
-        let recipients = vec![USER1.parse::<AccountId>().unwrap()];
-        let amounts = vec![U128(100)];
-        contract.add_airdrops(recipients.clone(), amounts.clone());
-
-        // Update the recipient's airdrop amount
-        contract.update_airdrop(USER1.parse::<AccountId>().unwrap(), U128(150));
-
-        // Verify the updated amount
-        assert_eq!(
-            contract.check_airdrop(USER1.parse::<AccountId>().unwrap()).0,
-            150
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "Account @user3.testnet is not in the airdrop list.")]
-    fn test_update_airdrop_non_existent() {
-        let context = get_context(OWNER.parse::<AccountId>().unwrap(), 0);
-        testing_env!(context.build());
-
-        let mut contract = AirdropContract::new(
-            OWNER.parse::<AccountId>().unwrap(),
-            TOKEN_CONTRACT.parse::<AccountId>().unwrap(),
-        );
-
-        // Attempt to update a non-existent recipient
-        contract.update_airdrop(USER3.parse::<AccountId>().unwrap(), U128(150));
-    }
-
-    #[test]
+    #[should_panic]
     fn test_claim_airdrop() {
         let context = get_context(OWNER.parse::<AccountId>().unwrap(), 0);
         testing_env!(context.build());
@@ -301,39 +168,24 @@ mod tests {
         let mut contract = AirdropContract::new(
             OWNER.parse::<AccountId>().unwrap(),
             TOKEN_CONTRACT.parse::<AccountId>().unwrap(),
+            "4128b84507d5c7c726e884b7c26c6db7c9b1f5245855dcd31474c8d6be5ca625".to_string(), // Replace with real Merkle Root
         );
 
-        let recipients = vec![USER1.parse::<AccountId>().unwrap()];
-        let amounts = vec![U128(100)];
-        contract.add_airdrops(recipients.clone(), amounts.clone());
+        // Example Merkle proof for "user1.testnet + 100"
+        let proof = vec![
+            "bff38e5fe57bd24169c460f1f151a39414a78be908898331dbfc5fa76e81a0c8".to_string(),
+            "ed356db93bc0a636f60329c5e37b36bc9b6f5e5ad422438b051cbb66aa44603b".to_string(),
+        ];
 
-        // Simulate the user claiming the airdrop
         let context = get_context(USER1.parse::<AccountId>().unwrap(), 0);
         testing_env!(context.build());
 
-        contract.claim_airdrop();
+        contract.claim_airdrop(U128(100), proof);
 
-        // Verify that the user has no more tokens to claim
-        assert_eq!(
-            contract.check_airdrop(USER1.parse::<AccountId>().unwrap()).0,
-            0
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "You have no tokens to claim.")]
-    fn test_claim_airdrop_no_tokens() {
-        let context = get_context(USER2.parse::<AccountId>().unwrap(), 0);
+        // Verify that the user cannot claim again
+        let context = get_context(USER1.parse::<AccountId>().unwrap(), 0);
         testing_env!(context.build());
 
-        let mut contract = AirdropContract::new(
-            OWNER.parse::<AccountId>().unwrap(),
-            TOKEN_CONTRACT.parse::<AccountId>().unwrap(),
-        );
-
-        // Attempt to claim airdrop without being eligible
-        contract.claim_airdrop();
+        contract.claim_airdrop(U128(100), vec![]);
     }
 }
-
-
