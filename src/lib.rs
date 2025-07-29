@@ -1,5 +1,5 @@
 use near_sdk::json_types::U128;
-use near_sdk::{env, near, AccountId, Gas, NearToken, PanicOnDefault, Promise};
+use near_sdk::{env, near, serde_json, AccountId, Gas, NearToken, PanicOnDefault, Promise};
 
 /// Contract to manage airdrops using a Merkle Tree
 #[derive(PanicOnDefault)]
@@ -44,7 +44,7 @@ impl AirdropContract {
     /// Allows users to claim their airdrop if they are eligible.
     /// - `amount`: The amount of tokens the user claims.
     /// - `merkle_proof`: The Merkle proof validating the user's claim.
-    pub fn claim_airdrop(&mut self, amount: U128, merkle_proof: Vec<String>) {
+    pub fn claim_airdrop(&mut self, amount: U128, merkle_proof: Vec<String>) -> Promise {
         let account_id = env::predecessor_account_id();
 
         // Ensure the user has not already claimed
@@ -63,26 +63,47 @@ impl AirdropContract {
         // Mark the account as claimed
         self.claimed.insert(account_id.clone());
 
-        // Transfer the tokens to the user using NEP-141's `ft_transfer`
+        // Always call storage_deposit first, regardless of registration status
+        Promise::new(self.token_contract.clone())
+            .function_call(
+                "storage_deposit".to_string(),
+                near_sdk::serde_json::json!({
+                    "account_id": account_id,
+                    "registration_only": true
+                })
+                .to_string()
+                .into_bytes(),
+                NearToken::from_yoctonear(1_250_000_000_000_000_000_000),
+                Gas::from_gas(10_000_000_000_000),
+            )
+            // Chain to transfer tokens after storage_deposit
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(Gas::from_gas(40_000_000_000_000))
+                    .on_storage_deposit_then_transfer(account_id, amount),
+            )
+    }
+
+    /// Callback: After storage_deposit, attempt to transfer the airdrop tokens.
+    #[private]
+    pub fn on_storage_deposit_then_transfer(
+        &mut self,
+        account_id: AccountId,
+        amount: U128,
+        #[callback_result] _call_result: Result<Option<serde_json::Value>, near_sdk::PromiseError>,
+    ) -> Promise {
         Promise::new(self.token_contract.clone()).function_call(
             "ft_transfer".to_string(),
-            near_sdk::serde_json::json!({
+            serde_json::json!({
                 "receiver_id": account_id,
                 "amount": amount,
             })
             .to_string()
             .into_bytes(),
-            NearToken::from_yoctonear(1), // Attach 1 yoctoNEAR for cross-contract call
-            Gas::from_gas(50_000_000_000_000),
-        );
-
-        // Log the claim
-        env::log_str(&format!(
-            "Account @{} claimed {} tokens from @{}.",
-            account_id, amount.0, self.token_contract
-        ));
+            NearToken::from_yoctonear(1),
+            Gas::from_gas(20_000_000_000_000),
+        )
     }
-
     /// Verifies a Merkle proof.
     /// - `leaf`: The leaf node (e.g., "account_id + amount").
     /// - `root`: The root of the Merkle tree.
