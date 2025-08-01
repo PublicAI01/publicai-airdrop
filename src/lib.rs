@@ -1,5 +1,7 @@
 use near_sdk::json_types::U128;
-use near_sdk::{env, near, serde_json, AccountId, Gas, NearToken, PanicOnDefault, Promise};
+use near_sdk::{
+    assert_one_yocto, env, near, serde_json, AccountId, Gas, NearToken, PanicOnDefault, Promise,
+};
 
 /// Contract to manage airdrops using a Merkle Tree
 #[derive(PanicOnDefault)]
@@ -31,7 +33,9 @@ impl AirdropContract {
 
     /// Updates the Merkle root (only callable by the owner).
     /// - `merkle_root`: The new Merkle root representing the airdrop list.
+    #[payable]
     pub fn update_merkle_root(&mut self, merkle_root: String) {
+        assert_one_yocto();
         assert_eq!(
             self.owner_id,
             env::predecessor_account_id(),
@@ -44,7 +48,9 @@ impl AirdropContract {
     /// Allows users to claim their airdrop if they are eligible.
     /// - `amount`: The amount of tokens the user claims.
     /// - `merkle_proof`: The Merkle proof validating the user's claim.
+    #[payable]
     pub fn claim_airdrop(&mut self, amount: U128, merkle_proof: Vec<String>) -> Promise {
+        assert_one_yocto();
         let account_id = env::predecessor_account_id();
 
         // Ensure the user has not already claimed
@@ -54,7 +60,7 @@ impl AirdropContract {
         );
 
         // Verify the Merkle proof
-        let leaf = format!("{}{}", account_id, amount.0);
+        let leaf = format!("{}:{}", account_id, amount.0);
         assert!(
             Self::verify_merkle_proof(leaf, &self.merkle_root, &merkle_proof),
             "Merkle proof verification failed."
@@ -90,8 +96,13 @@ impl AirdropContract {
         &mut self,
         account_id: AccountId,
         amount: U128,
-        #[callback_result] _call_result: Result<Option<serde_json::Value>, near_sdk::PromiseError>,
+        #[callback_result] call_result: Result<Option<serde_json::Value>, near_sdk::PromiseError>,
     ) -> Promise {
+        // If storage_deposit failed, revert and do not transfer tokens
+        assert!(
+            call_result.is_ok(),
+            "Failed to register account for token storage_deposit"
+        );
         Promise::new(self.token_contract.clone()).function_call(
             "ft_transfer".to_string(),
             serde_json::json!({
@@ -161,19 +172,19 @@ mod tests {
         AirdropContract::new(
             OWNER.parse::<AccountId>().unwrap(),
             TOKEN_CONTRACT.parse::<AccountId>().unwrap(),
-            "6867b92646b924dee3f594488111e91ced74800da03a4be76e8175277c380f4d".to_string(), // Replace with real Merkle Root
+            "af6df487c9daa2c7d6ec7fb9a33f22d6af13323c1f0d9b1a7df3ec0aaea02e94".to_string(), // Replace with real Merkle Root
         );
 
-        // Example Merkle proof for "user1.testnet + 100"
-        let leaf = "user1.testnet100".to_string();
+        // Example Merkle proof for "user1.testnet + : + 100"
+        let leaf = "user1.testnet:100".to_string();
         let proof = vec![
-            "ed356db93bc0a636f60329c5e37b36bc9b6f5e5ad422438b051cbb66aa44603b".to_string(),
-            "bff38e5fe57bd24169c460f1f151a39414a78be908898331dbfc5fa76e81a0c8".to_string(),
+            "154a0a614231d830d36a51e980c0cb836e8d2d718345e6c5e0e10bb3687ddb99".to_string(),
+            "86b99e84ab1b07c73445edf731d9c0d876c6229e36a5bf22c210690e2cdc18b2".to_string(),
         ];
 
         let valid = AirdropContract::verify_merkle_proof(
             leaf,
-            &"6867b92646b924dee3f594488111e91ced74800da03a4be76e8175277c380f4d".to_string(),
+            &"af6df487c9daa2c7d6ec7fb9a33f22d6af13323c1f0d9b1a7df3ec0aaea02e94".to_string(),
             &proof,
         );
 
@@ -189,13 +200,13 @@ mod tests {
         let mut contract = AirdropContract::new(
             OWNER.parse::<AccountId>().unwrap(),
             TOKEN_CONTRACT.parse::<AccountId>().unwrap(),
-            "4128b84507d5c7c726e884b7c26c6db7c9b1f5245855dcd31474c8d6be5ca625".to_string(), // Replace with real Merkle Root
+            "42bb039d55571a5564e772449aab51904f292f69ea5efb6becde8f8f5c37d643".to_string(), // Replace with real Merkle Root
         );
 
-        // Example Merkle proof for "user1.testnet + 100"
+        // Example Merkle proof for "user1.testnet + : + 100"
         let proof = vec![
-            "bff38e5fe57bd24169c460f1f151a39414a78be908898331dbfc5fa76e81a0c8".to_string(),
-            "ed356db93bc0a636f60329c5e37b36bc9b6f5e5ad422438b051cbb66aa44603b".to_string(),
+            "bcd3ddbb88881cf79a7f4de2b1024a50f83356856ff31367ecac4526172106a4".to_string(),
+            "9674039b49ffcb659ac14ed833f9e6c9070d457a36ef0a5a28bc257e145c8160".to_string(),
         ];
 
         let context = get_context(USER1.parse::<AccountId>().unwrap(), 0);
