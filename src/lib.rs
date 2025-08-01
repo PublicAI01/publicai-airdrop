@@ -1,6 +1,7 @@
 use near_sdk::json_types::U128;
 use near_sdk::{
-    assert_one_yocto, env, near, serde_json, AccountId, Gas, NearToken, PanicOnDefault, Promise,
+    assert_one_yocto, env, ext_contract, near, serde_json, AccountId, Gas, NearToken,
+    PanicOnDefault, Promise,
 };
 
 /// Contract to manage airdrops using a Merkle Tree
@@ -66,9 +67,6 @@ impl AirdropContract {
             "Merkle proof verification failed."
         );
 
-        // Mark the account as claimed
-        self.claimed.insert(account_id.clone());
-
         // Always call storage_deposit first, regardless of registration status
         Promise::new(self.token_contract.clone())
             .function_call(
@@ -103,18 +101,43 @@ impl AirdropContract {
             call_result.is_ok(),
             "Failed to register account for token storage_deposit"
         );
-        Promise::new(self.token_contract.clone()).function_call(
-            "ft_transfer".to_string(),
-            serde_json::json!({
-                "receiver_id": account_id,
-                "amount": amount,
-            })
-            .to_string()
-            .into_bytes(),
-            NearToken::from_yoctonear(1),
-            Gas::from_gas(20_000_000_000_000),
-        )
+        Promise::new(self.token_contract.clone())
+            .function_call(
+                "ft_transfer".to_string(),
+                serde_json::json!({
+                    "receiver_id": account_id.clone(),
+                    "amount": amount,
+                })
+                .to_string()
+                .into_bytes(),
+                NearToken::from_yoctonear(1),
+                Gas::from_gas(20_000_000_000_000),
+            )
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(Gas::from_gas(5_000_000_000_000))
+                    .on_ft_transfer_then_claimed(account_id, amount),
+            )
     }
+
+    /// Callback: After ft_transfer, only then mark the account as claimed.
+    #[private]
+    pub fn on_ft_transfer_then_claimed(
+        &mut self,
+        account_id: AccountId,
+        amount: U128,
+        #[callback_result] call_result: Result<(), near_sdk::PromiseError>,
+    ) -> bool {
+        assert!(call_result.is_ok(), "Airdrop transfer failed");
+        // Mark the account as claimed
+        self.claimed.insert(account_id.clone());
+        env::log_str(&format!(
+            "Account @{} claimed {} tokens from @{}.",
+            account_id, amount.0, self.token_contract
+        ));
+        true
+    }
+
     /// Verifies a Merkle proof.
     /// - `leaf`: The leaf node (e.g., "account_id + amount").
     /// - `root`: The root of the Merkle tree.
@@ -209,13 +232,13 @@ mod tests {
             "9674039b49ffcb659ac14ed833f9e6c9070d457a36ef0a5a28bc257e145c8160".to_string(),
         ];
 
-        let context = get_context(USER1.parse::<AccountId>().unwrap(), 0);
+        let context = get_context(USER1.parse::<AccountId>().unwrap(), 1);
         testing_env!(context.build());
 
         contract.claim_airdrop(U128(100), proof);
 
         // Verify that the user cannot claim again
-        let context = get_context(USER1.parse::<AccountId>().unwrap(), 0);
+        let context = get_context(USER1.parse::<AccountId>().unwrap(), 1);
         testing_env!(context.build());
 
         contract.claim_airdrop(U128(100), vec![]);
