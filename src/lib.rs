@@ -1,6 +1,6 @@
 use near_sdk::json_types::U128;
 use near_sdk::{
-    assert_one_yocto, env, ext_contract, near, serde_json, AccountId, Gas, NearToken,
+    assert_one_yocto, env, log, near, require, serde_json, AccountId, Gas, NearToken,
     PanicOnDefault, Promise,
 };
 
@@ -46,6 +46,19 @@ impl AirdropContract {
         env::log_str(&format!("Merkle root updated to {}", self.merkle_root));
     }
 
+    #[payable]
+    pub fn update_owner(&mut self, new_owner: AccountId) -> bool {
+        assert_one_yocto();
+        require!(
+            env::predecessor_account_id() == self.owner_id,
+            "Owner's method"
+        );
+        require!(!new_owner.as_str().is_empty(), "New owner cannot be empty");
+        log!("Owner updated from {} to {}", self.owner_id, new_owner);
+        self.owner_id = new_owner;
+        true
+    }
+
     /// Allows users to claim their airdrop if they are eligible.
     /// - `amount`: The amount of tokens the user claims.
     /// - `merkle_proof`: The Merkle proof validating the user's claim.
@@ -66,6 +79,9 @@ impl AirdropContract {
             Self::verify_merkle_proof(leaf, &self.merkle_root, &merkle_proof),
             "Merkle proof verification failed."
         );
+
+        // Mark the account as claimed
+        self.claimed.insert(account_id.clone());
 
         // Always call storage_deposit first, regardless of registration status
         Promise::new(self.token_contract.clone())
@@ -97,10 +113,10 @@ impl AirdropContract {
         #[callback_result] call_result: Result<Option<serde_json::Value>, near_sdk::PromiseError>,
     ) -> Promise {
         // If storage_deposit failed, revert and do not transfer tokens
-        assert!(
-            call_result.is_ok(),
-            "Failed to register account for token storage_deposit"
-        );
+        if call_result.is_err() {
+            self.claimed.remove(&account_id);
+            return Promise::new(env::current_account_id());
+        }
         Promise::new(self.token_contract.clone())
             .function_call(
                 "ft_transfer".to_string(),
@@ -128,9 +144,10 @@ impl AirdropContract {
         amount: U128,
         #[callback_result] call_result: Result<(), near_sdk::PromiseError>,
     ) -> bool {
-        assert!(call_result.is_ok(), "Airdrop transfer failed");
-        // Mark the account as claimed
-        self.claimed.insert(account_id.clone());
+        if call_result.is_err() {
+            self.claimed.remove(&account_id);
+            return false;
+        }
         env::log_str(&format!(
             "Account @{} claimed {} tokens from @{}.",
             account_id, amount.0, self.token_contract

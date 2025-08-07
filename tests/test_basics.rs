@@ -1,7 +1,6 @@
 use anyhow::Result;
 use near_sdk::json_types::U128;
-use near_sdk::Gas;
-use near_workspaces::{compile_project, sandbox, types::NearToken, Account, Contract};
+use near_workspaces::{compile_project, sandbox, types::NearToken, Contract};
 use serde_json::json;
 
 /// Integration test that deploys the real airdrop & token contracts and shows that
@@ -80,7 +79,11 @@ async fn test_claim_airdrop_cross_contract_failure() -> Result<()> {
         .max_gas()
         .transact()
         .await?;
-    assert_eq!(airdrop_exec.is_success(), false, "Airdrop should failed");
+    assert_eq!(
+        airdrop_exec.is_success(),
+        true,
+        "Airdrop should success but return false"
+    );
 
     // Wait for the claim_airdrop cross-contract call to complete
     worker.fast_forward(10).await?;
@@ -120,6 +123,7 @@ async fn test_claim_airdrop_cross_contract_failure() -> Result<()> {
         .max_gas()
         .transact()
         .await?;
+
     assert_eq!(airdrop_exec.is_success(), true, "Airdrop should success");
     // Wait for the airdrop cross-contract call to complete
     worker.fast_forward(10).await?;
