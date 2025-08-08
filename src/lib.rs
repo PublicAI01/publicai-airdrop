@@ -3,6 +3,10 @@ use near_sdk::{
     assert_one_yocto, env, log, near, require, serde_json, AccountId, Gas, NearToken,
     PanicOnDefault, Promise,
 };
+use serde_json::json;
+const CURRENT_STATE_VERSION: u32 = 1;
+const NO_DEPOSIT: NearToken = NearToken::from_near(0);
+const OUTER_UPGRADE_GAS: Gas = Gas::from_tgas(20);
 
 /// Contract to manage airdrops using a Merkle Tree
 #[derive(PanicOnDefault)]
@@ -181,6 +185,47 @@ impl AirdropContract {
     /// Checks if an account has already claimed their airdrop.
     pub fn has_claimed(&self, account_id: AccountId) -> bool {
         self.claimed.contains(&account_id)
+    }
+
+    #[private]
+    #[init(ignore_state)]
+    #[allow(unused_variables)]
+    pub fn migrate(from_version: u32) -> Self {
+        env::state_read().unwrap_or_else(|| env::panic_str("ERR_FAILED_TO_READ_STATE"))
+    }
+
+    pub fn update_contract(&self) {
+        // Ensure only owner can call
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner_id,
+            "Only the owner can upgrade"
+        );
+
+        // Receive the code directly from the input to avoid the
+        // GAS overhead of deserializing parameters
+        let code = env::input().unwrap_or_else(|| env::panic_str("ERR_NO_INPUT"));
+        // Deploy the contract code.
+        let promise_id = env::promise_batch_create(&env::current_account_id());
+        env::promise_batch_action_deploy_contract(promise_id, &code);
+        // Call promise to migrate the state.
+        // Batched together to fail upgrade if migration fails.
+        env::promise_batch_action_function_call(
+            promise_id,
+            "migrate",
+            &json!({ "from_version": CURRENT_STATE_VERSION })
+                .to_string()
+                .into_bytes(),
+            NO_DEPOSIT,
+            env::prepaid_gas()
+                .saturating_sub(env::used_gas())
+                .saturating_sub(OUTER_UPGRADE_GAS),
+        );
+        env::promise_return(promise_id);
+    }
+    /// Query owner
+    pub fn owner(&self) -> AccountId {
+        self.owner_id.clone()
     }
 }
 
