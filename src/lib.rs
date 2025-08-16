@@ -227,6 +227,64 @@ impl AirdropContract {
     pub fn owner(&self) -> AccountId {
         self.owner_id.clone()
     }
+    /// Only owner can call. Transfer `amount` of given token to `to`.
+    #[payable]
+    pub fn withdraw_token(&mut self, amount: U128) -> Promise {
+        assert_one_yocto();
+        // Ensure only owner can call
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner_id,
+            "Only the owner can withdraw tokens"
+        );
+
+        Promise::new(self.token_contract.clone())
+            .function_call(
+                "ft_balance_of".to_string(),
+                serde_json::json!({
+                    "account_id": env::current_account_id()
+                })
+                .to_string()
+                .into_bytes(),
+                NearToken::from_near(0),
+                Gas::from_gas(10_000_000_000_000),
+            )
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(Gas::from_gas(30_000_000_000_000))
+                    .on_check_balance_then_withdraw(
+                        self.token_contract.clone(),
+                        self.owner_id.clone(),
+                        amount,
+                    ),
+            )
+    }
+    #[private]
+    pub fn on_check_balance_then_withdraw(
+        &self,
+        token_contract: AccountId,
+        to: AccountId,
+        amount: U128,
+        #[callback_result] call_result: Result<Option<U128>, near_sdk::PromiseError>,
+    ) -> Promise {
+        let balance = match call_result {
+            Ok(Some(b)) => b.0,
+            _ => env::panic_str("Failed to get token balance"),
+        };
+        assert!(amount.0 <= balance, "Not enough token balance to withdraw");
+
+        Promise::new(token_contract).function_call(
+            "ft_transfer".to_string(),
+            serde_json::json!({
+                "receiver_id": to,
+                "amount": amount,
+            })
+            .to_string()
+            .into_bytes(),
+            NearToken::from_yoctonear(1),
+            Gas::from_gas(10_000_000_000_000),
+        )
+    }
 }
 
 #[cfg(test)]
