@@ -285,6 +285,24 @@ impl AirdropContract {
             Gas::from_gas(10_000_000_000_000),
         )
     }
+
+    #[payable]
+    pub fn clear_state(&mut self) {
+        assert_one_yocto();
+        // Ensure only owner can call
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner_id,
+            "Only the owner can withdraw tokens"
+        );
+
+        self.merkle_root.clear();
+
+        self.claimed.clear();
+
+        let su = env::storage_usage();
+        env::log_str(&format!("storage_usage after clear: {}", su));
+    }
 }
 
 #[cfg(test)]
