@@ -3,7 +3,9 @@ use near_sdk::{
     assert_one_yocto, env, log, near, require, serde_json, AccountId, Gas, NearToken,
     PanicOnDefault, Promise,
 };
+use near_sdk::store::IterableSet;
 use serde_json::json;
+
 const CURRENT_STATE_VERSION: u32 = 1;
 const NO_DEPOSIT: NearToken = NearToken::from_near(0);
 const OUTER_UPGRADE_GAS: Gas = Gas::from_tgas(20);
@@ -19,7 +21,7 @@ pub struct AirdropContract {
     // Root hash of the Merkle tree
     merkle_root: String,
     // Mapping to keep track of claimed accounts
-    claimed: std::collections::HashSet<AccountId>,
+    claimed: IterableSet<AccountId>,
 }
 
 #[near]
@@ -32,7 +34,7 @@ impl AirdropContract {
             owner_id,
             token_contract,
             merkle_root,
-            claimed: std::collections::HashSet::new(),
+            claimed: IterableSet::new(b"c"),
         }
     }
 
